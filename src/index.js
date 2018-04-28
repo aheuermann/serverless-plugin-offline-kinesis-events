@@ -3,30 +3,47 @@ import * as AWS from 'aws-sdk'
 import BB from 'bluebird'
 import winston from 'winston'
 
-/**
- * Based on ServerlessWebpack.run
- * @param stats
- */
-function getRunnableLambda(slsWebpack, stats, functionName) {
-  const handler = slsWebpack.loadHandler(stats, functionName, true)
-  return (event) => {
-    const context = slsWebpack.getContext(functionName)
-    return new BB(
-      (resolve, reject) => handler(
-        event,
-        context,
-        (err, res) => {
-          if (err) {
-            reject(err)
-          } else {
-            resolve(res)
-          }
-        }
-      ))
+const MAX_CONSECUTIVE_ERRORS = 10
+
+function createLambdaContext(fun, cb) {
+  const functionName = fun.name
+  const endTime = new Date().getTime() + (fun.timeout ? fun.timeout * 1000 : 6000)
+  // eslint-disable-next-line no-extra-parens
+  const done = typeof cb === 'function' ? cb : ((x, y) => x || y)
+
+  return {
+    /* Methods */
+    done,
+    succeed: res => done(null, res),
+    fail: err => done(err, null),
+    getRemainingTimeInMillis: () => endTime - new Date().getTime(),
+
+    /* Properties */
+    functionName,
+    memoryLimitInMB: fun.memorySize,
+    functionVersion: `offline_functionVersion_for_${functionName}`,
+    invokedFunctionArn: `offline_invokedFunctionArn_for_${functionName}`,
+    awsRequestId: `offline_awsRequestId_${Math.random().toString(10).slice(2)}`,
+    logGroupName: `offline_logGroupName_for_${functionName}`,
+    logStreamName: `offline_logStreamName_for_${functionName}`,
+    identity: {},
+    clientContext: {}
   }
 }
 
-const MAX_CONSECUTIVE_ERRORS = 10
+function getFunctionOptions(fun, funName, servicePath) {
+  // Split handler into method name and path i.e. handler.run
+  const handlerPath = fun.handler.split('.')[0]
+  const handlerName = fun.handler.split('/').pop().split('.')[1]
+
+  return {
+    funName,
+    handlerName, // i.e. run
+    handlerPath: `${servicePath}/${handlerPath}`,
+    funTimeout: (fun.timeout || 30) * 1000,
+    babelOptions: ((fun.custom || {}).runtime || {}).babel
+  }
+}
 
 class ServerlessOfflineKinesisEvents {
   constructor(serverless, options) {
@@ -47,19 +64,16 @@ class ServerlessOfflineKinesisEvents {
 
   static async createRegistry(serverless) {
     // Get a handle on the compiled functions
-    // TODO(msills): Do not rely on this plugin.
-    const slsWebpack = _.find(serverless.pluginManager.plugins, p => p.constructor.name === 'ServerlessWebpack')
-    const compileStats = await slsWebpack.compile()
-
     const registry = {}
     for (const functionName of _.keys(serverless.service.functions)) {
       const func = serverless.service.functions[functionName]
       // Get the list of streams for the function
       const streamEvents = _.filter(func.events || [], e => 'stream' in e)
+      const fun = serverless.service.getFunction(functionName)
       for (const s of streamEvents) {
         const streamName = s.stream.arn.split('/').slice(-1)[0]
         registry[streamName] = registry[streamName] || []
-        registry[streamName].push(getRunnableLambda(slsWebpack, compileStats, functionName))
+        registry[streamName].push(fun)
       }
     }
     return registry
@@ -83,16 +97,27 @@ class ServerlessOfflineKinesisEvents {
         }).promise()))
   }
 
-  static async _runLambdas(streamResults, registry) {
+  static async _runLambdas(serverless, streamResults, registry) {
     // Wait for the functions to execute
     await BB.all(_.chain(streamResults)
       .entries()
       .flatMap(([name, result]) => {
         winston.debug(`Stream '${name}' returned ${result.Records.length} records`)
+        if (result.Records.length < 1) {
+          return
+        }
+
         // Parse the records
         const records = _.map(result.Records, r => JSON.parse(r.Data.toString()))
         // Apply the functions that use that stream
-        return registry[name].map(f => f({ Records: records }))
+        return BB.all(registry[name].map(fObj => {
+          const context = createLambdaContext(fObj)
+          const funOpts = getFunctionOptions(fObj, fObj.handler, serverless.config.servicePath)
+
+          const handler = require(funOpts.handlerPath)[funOpts.handlerName]
+
+          return BB.promisify(handler)({ Records: records }, context)
+        }))
       })
       .value())
   }
@@ -139,7 +164,7 @@ class ServerlessOfflineKinesisEvents {
       // Repoll the streams
       const streamResults = await ServerlessOfflineKinesisEvents._repollStreams(kinesis, streamIterators) // eslint-disable-line
       try {
-        await ServerlessOfflineKinesisEvents._runLambdas(streamResults, registry) // eslint-disable-line
+        await ServerlessOfflineKinesisEvents._runLambdas(this.serverless, streamResults, registry) // eslint-disable-line
       } catch (err) {
         consecutiveErrors += 1
         if (consecutiveErrors > MAX_CONSECUTIVE_ERRORS) {
